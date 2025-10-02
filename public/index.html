@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>SBC Optimizer (No Chem)</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:24px;max-width:800px}
+  input,button{font-size:16px;padding:8px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  .card{border:1px solid #ddd;border-radius:8px;padding:12px;margin:12px 0}
+  table{width:100%;border-collapse:collapse}
+  th,td{border-bottom:1px solid #eee;padding:6px;text-align:left}
+</style>
+</head>
+<body>
+<h1>SBC Optimizer (No Chem)</h1>
+
+<div class="card">
+  <div class="row">
+    <label>Zielrating <input id="target" type="number" value="84" min="70" max="99"/></label>
+    <label>Slots <input id="slots" type="number" value="11" min="1" max="11"/></label>
+    <label>Erlaubte Ratings
+      <input id="allowed" type="text" value="82-86" />
+    </label>
+  </div>
+  <div class="row">
+    <button id="load">Preise laden</button>
+    <button id="force">Frisch laden (Admin)</button>
+    <button id="solve">Günstigste Lösung</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<div id="result"></div>
+
+<script>
+let prices = {};
+let adminToken = "";
+
+// Hilfen
+function parseAllowed(str){
+  str = (str||"").trim();
+  if(!str) return null;
+  if(str.includes("-")){
+    const [a,b] = str.split("-").map(s=>parseInt(s.trim(),10));
+    if(Number.isFinite(a) && Number.isFinite(b) && a<=b){
+      const arr=[]; for(let r=a;r<=b;r++) arr.push(r); return arr;
+    }
+  }
+  return str.split(",").map(s=>parseInt(s.trim(),10)).filter(Number.isFinite);
+}
+function prefixCosts(list){ const pref=[0]; let s=0; for(const it of list){ s+=it.price; pref.push(s); } return pref; }
+function solveDP(target, slots, ratingToPlayers){
+  const levels = Object.keys(ratingToPlayers).map(Number).sort((a,b)=>a-b);
+  if(levels.length===0) return null;
+  const maxR = levels[levels.length-1], maxSum = maxR*slots, INF=1e18;
+  const pref={}, avail={};
+  for(const r of levels){
+    const list = [...ratingToPlayers[r]].sort((a,b)=>a.price-b.price);
+    ratingToPlayers[r] = list;
+    pref[r] = prefixCosts(list);
+    avail[r] = list.length;
+  }
+  const dp = Array.from({length:slots+1},()=>Array(maxSum+1).fill(INF));
+  const bt = Array.from({length:slots+1},()=>Array(maxSum+1).fill(null));
+  dp[0][0]=0;
+  for(const r of levels){
+    const maxTake = Math.min(avail[r], slots);
+    for(let used=slots; used>=0; used--){
+      for(let sum=0; sum<=maxSum; sum++){
+        const base = dp[used][sum]; if(base===INF) continue;
+        for(let k=1;k<=maxTake;k++){
+          const nu=used+k; if(nu>slots) break;
+          const ns=sum+r*k; if(ns>maxSum) break;
+          const cost=base+pref[r][k];
+          if(cost<dp[nu][ns]){ dp[nu][ns]=cost; bt[nu][ns]={used,sum,r,k}; }
+        }
+      }
+    }
+  }
+  const need = target*slots;
+  let bestSum=-1, bestCost=INF;
+  for(let s=need; s<=maxSum; s++){ if(dp[slots][s]<bestCost){ bestCost=dp[slots][s]; bestSum=s; } }
+  if(bestCost===INF) return null;
+  let u=slots, s=bestSum; const comp={};
+  while(u>0){ const b=bt[u][s]; if(!b) break; comp[b.r]=(comp[b.r]||0)+b.k; u=b.used; s=b.sum; }
+  const players=[];
+  for(const r of Object.keys(comp).map(Number)){
+    const cnt=comp[r]; players.push(...ratingToPlayers[r].slice(0,cnt).map(p=>({name:p.name,rating:r,price:p.price})));
+  }
+  return { total: bestCost, composition: comp, players };
+}
+
+// UI
+async function fetchPrices(force=false){
+  const allowed = document.getElementById("allowed").value || "82-86";
+  const st = document.getElementById("status");
+  st.textContent = force ? "Frisch laden …" : "Preise laden …";
+  const headers = {};
+  if(force && adminToken){ headers["x-api-key"] = adminToken; }
+  const url = `/prices?ratings=${encodeURIComponent(allowed)}${force ? "&force=1" : ""}`;
+  const r = await fetch(url, { headers, cache:"no-store" });
+  if(!r.ok){ st.textContent = "Fehler beim Laden (evtl. kein Admin-Token?)."; return; }
+  prices = await r.json();
+  const keys = Object.keys(prices).sort();
+  st.textContent = `Preise geladen: Ratings ${keys.join(", ")}`;
+}
+document.getElementById("load").onclick = () => fetchPrices(false);
+document.getElementById("force").onclick = async () => {
+  const maybe = prompt("Admin-Token (nur du):", "");
+  if(maybe!==null){ adminToken = maybe.trim(); }
+  await fetchPrices(true);
+};
+document.getElementById("solve").onclick = () => {
+  if(!prices || Object.keys(prices).length===0){ alert("Bitte zuerst Preise laden."); return; }
+  const target = parseInt(document.getElementById("target").value,10);
+  const slots  = parseInt(document.getElementById("slots").value,10);
+  const allowed = parseAllowed(document.getElementById("allowed").value);
+  const ratingToPlayers={};
+  const keys = allowed? allowed.map(String) : Object.keys(prices);
+  for(const k of keys){ if(prices[k] && prices[k].length>0) ratingToPlayers[parseInt(k,10)] = prices[k]; }
+  const res = solveDP(target, slots, ratingToPlayers);
+  const out = document.getElementById("result");
+  if(!res){ out.innerHTML = "<p>Keine Lösung mit den verfügbaren Preisen.</p>"; return; }
+  const compRows = Object.entries(res.composition).sort((a,b)=>b[0]-a[0]).map(([r,c])=>`<tr><td>${r}</td><td>${c}</td></tr>`).join("");
+  const playerRows = res.players.sort((a,b)=>b.rating-a.rating || a.price-b.price).map(p=>`<tr><td>${p.rating}</td><td>${p.name}</td><td>${p.price.toLocaleString()}</td></tr>`).join("");
+  out.innerHTML = `
+    <div class="card">
+      <h3>Gesamtkosten: ${res.total.toLocaleString()} Coins</h3>
+      <h4>Verteilung (Rating → Anzahl)</h4>
+      <table><thead><tr><th>Rating</th><th>Anzahl</th></tr></thead><tbody>${compRows}</tbody></table>
+      <h4>Konkrete Spieler</h4>
+      <table><thead><tr><th>Rating</th><th>Spieler</th><th>Preis</th></tr></thead><tbody>${playerRows}</tbody></table>
+    </div>`;
+};
+</script>
+</body>
+</html>
