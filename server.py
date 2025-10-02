@@ -107,3 +107,7 @@ def get_prices(
 
     out = {str(r): CACHE["data"].get(str(r), []) for r in want}
     return JSONResponse(out)
+
+@app.get("/health")
+def health():
+    return {"ok": True}
