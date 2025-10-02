@@ -1,3 +1,6 @@
+from fastapi import FastAPI
+app = FastAPI(title="SBC Mini (No Chem)")
+
 import re
 from bs4 import BeautifulSoup
 
