@@ -7,10 +7,10 @@ from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-# ---------------- Config ----------------
-APP_TOKEN = os.getenv("APP_TOKEN", "change-me")
-MAX_AGE_SECONDS = 6 * 3600
-CACHE = {"ts": 0, "data": {}}
+# ========= Konfiguration =========
+APP_TOKEN = os.getenv("APP_TOKEN", "change-me")   # für force=1
+MAX_AGE_SECONDS = 6 * 3600                        # 6h Cache
+CACHE = {"ts": 0, "data": {}}                     # { "84": [{name,price}, ...], ... }
 RATINGS_DEFAULT = "82-86"
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) "
@@ -23,8 +23,8 @@ HEADERS = {
     "Referer": "https://www.google.com/"
 }
 
-# ---------------- FastAPI App ----------------
-app = FastAPI(title="SBC Optimizer (No Chem)")
+# ========= FastAPI App =========
+app = FastAPI(title="SBC Players – Live")
 
 PUBLIC_DIR = Path(__file__).parent / "public"
 app.mount("/static", StaticFiles(directory=PUBLIC_DIR), name="static")
@@ -32,7 +32,7 @@ app.mount("/static", StaticFiles(directory=PUBLIC_DIR), name="static")
 @app.get("/")
 def root():
     idx = PUBLIC_DIR / "index.html"
-    return FileResponse(str(idx)) if idx.exists() else HTMLResponse("<h1>index.html fehlt</h1>", 500)
+    return FileResponse(str(idx)) if idx.exists() else HTMLResponse("<h1>index.html fehlt</h1>", 404)
 
 @app.head("/")
 def head_root():
@@ -42,7 +42,7 @@ def head_root():
 def health():
     return {"ok": True}
 
-# ---------------- Helpers ----------------
+# ========= Helpers =========
 def parse_ratings(s: str) -> List[int]:
     s = (s or "").strip()
     if "-" in s:
@@ -60,16 +60,18 @@ def get_html(url: str) -> str:
         r.raise_for_status()
         return r.text
 
-# ---------------- FUT.GG Scraper (robust, ohne CSS-Klassen) ----------------
+# ========= FUT.GG Scraper (ohne fragile CSS-Klassen) =========
+# Beispiel-URL 84: https://www.fut.gg/players/?page=1&overall__gte=84&overall__lte=84
 FUTGG_URL = "https://www.fut.gg/players/?page={page}&overall__gte={r}&overall__lte={r}"
-PRICE_RE = re.compile(r'(\d+(?:[.,]\d+)?)([kKmM]?)')
 
-def _parse_price_text(txt: str) -> int:
+PRICE_TOKEN = re.compile(r'(\d+(?:[.,]\d+)?)([kKmM]?)')  # 4.4K / 1.2M / 12,500 etc.
+
+def parse_price_token(txt: str) -> int:
     t = (txt or "").strip().lower()
     if not t or any(bad in t for bad in ("extinct", "n/a", "—", "-", "unavailable")):
         return 0
     t = t.replace(" ", "")
-    m = PRICE_RE.search(t)
+    m = PRICE_TOKEN.search(t)
     if not m:
         return 0
     num = float(m.group(1).replace(",", "."))
@@ -78,13 +80,13 @@ def _parse_price_text(txt: str) -> int:
     elif suf == "m": num *= 1_000_000
     return int(round(num))
 
-def _name_from_chunk(chunk_html: str) -> str | None:
-    # ALT-Text (z. B. 'Banda - 85 - Rare')
+def extract_name_from_html(chunk_html: str) -> str | None:
+    # 1) alt="Name - 84 - ..."
     for m in re.finditer(r'alt="([^"]+)"', chunk_html):
         alt = m.group(1)
         if alt and not alt.lower().startswith(("coin", "sp", "sbc")):
             return alt.split(" - ")[0].strip()
-    # Fallback: Name aus URL-Slug
+    # 2) fallback: /players/<id>-barbra-banda/
     m = re.search(r'/players/\d+-([a-z0-9-]+)/', chunk_html)
     if m:
         slug = m.group(1)
@@ -96,18 +98,17 @@ def scrape_futgg_one_page(rating: int, page: int) -> List[Dict]:
     soup = BeautifulSoup(html, "html.parser")
     items: List[Dict] = []
 
-    # Jede Karte ist ein <a href="/players/...">…</a>
-    # Preis erkennbar am Coin-Icon + Preis-Token (4.4K, 82K, 1.2M oder 12,500)
-    anchors = soup.find_all("a", href=re.compile(r"^/players/"))
-    for a in anchors:
+    # Jede Karte als <a href="/players/...">…</a>; Preise erkennbar am Coin-Icon + Preistext
+    for a in soup.find_all("a", href=re.compile(r"^/players/")):
         block = str(a)
         if "/public-assets/coin.webp" not in block:
             continue
-        pm = re.search(r'(\d+(?:\.\d+)?[kKmM])', block) or re.search(r'\b\d{1,3}(?:,\d{3})+\b', block)
-        price_val = _parse_price_text(pm.group(0)) if pm else 0
+        pm = (re.search(r'(\d+(?:\.\d+)?[kKmM])', block) or
+              re.search(r'\b\d{1,3}(?:,\d{3})+\b', block))
+        price_val = parse_price_token(pm.group(0)) if pm else 0
         if price_val <= 0:
             continue
-        name = _name_from_chunk(block)
+        name = extract_name_from_html(block)
         if not name:
             continue
         items.append({"name": name, "price": price_val})
@@ -129,7 +130,7 @@ def scrape_futgg_for_rating(rating: int, max_pages: int = 3, min_needed: int = 2
         if len(all_items) >= min_needed:
             break
     all_items.sort(key=lambda x: x["price"])
-    print(f"[SCRAPER] rating {rating}: {len(all_items)} items")  # Log für Render
+    print(f"[SCRAPER] rating {rating}: {len(all_items)} items")
     return all_items
 
 def scrape_many(ratings: List[int]) -> Dict[str, List[Dict]]:
@@ -142,18 +143,32 @@ def scrape_many(ratings: List[int]) -> Dict[str, List[Dict]]:
             data[str(r)] = []
     return data
 
-# ---------------- Debug-Routen ----------------
+# ========= Diagnose (optional, sehr nützlich) =========
 @app.get("/debug_prices")
 def debug_prices(ratings: str = Query(RATINGS_DEFAULT)):
     want = parse_ratings(ratings)
-    data = scrape_many(want)  # immer frisch
+    data = scrape_many(want)  # frisch, ohne Cache
     counts = {str(r): len(data.get(str(r), [])) for r in want}
-    samples = {str(r): data.get(str(r), [])[:5] for r in want}
-    return {"counts": counts, "sample": samples}
+    sample = {str(r): data.get(str(r), [])[:5] for r in want}
+    return {"counts": counts, "sample": sample}
 
-# ---------------- API ----------------
-@app.get("/prices")
-def get_prices(
+@app.get("/raw")
+def raw(rating: int = Query(84), page: int = Query(1)):
+    url = FUTGG_URL.format(page=page, r=rating)
+    try:
+        html = get_html(url)
+    except Exception as e:
+        return {"ok": False, "error": str(e), "url": url}
+    return {
+        "ok": True, "url": url,
+        "html_len": len(html),
+        "has_coin_icon": ("/public-assets/coin.webp" in html),
+        "snippet": html[:500]
+    }
+
+# ========= API: flache Liste für die Tabelle =========
+@app.get("/players_flat")
+def players_flat(
     ratings: str = Query(RATINGS_DEFAULT),
     force: int = Query(0),
     x_api_key: str = Header(None)
@@ -170,5 +185,9 @@ def get_prices(
         CACHE["data"].update(scrape_many(want))
         CACHE["ts"] = now
 
-    out = {str(r): CACHE["data"].get(str(r), []) for r in want}
-    return JSONResponse(out)
+    flat = []
+    for r in want:
+        for item in CACHE["data"].get(str(r), []):
+            flat.append({"name": item["name"], "price": item["price"], "rating": r})
+    flat.sort(key=lambda x: (x["price"], -x["rating"], x["name"]))
+    return JSONResponse(flat)
