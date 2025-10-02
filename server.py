@@ -1,188 +1,109 @@
-import os, re, time, random, json
-from pathlib import Path
-from typing import List, Dict, Tuple
-import httpx
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query, Header
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
+# --- am Anfang stehen bleiben: Imports, App, HEADERS etc. ---
 
-# ---------------- Config ----------------
-APP_TOKEN = os.getenv("APP_TOKEN", "change-me")
-MAX_AGE_SECONDS = 6 * 3600
-CACHE = {"ts": 0, "data": {}}
-RATINGS_DEFAULT = "82-86"
+# ========= FUT.GG SCRAPER (aktualisiert) =========
 
-USER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-)
-REQ_HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/json",
-    "Accept-Language": "de,en;q=0.9",
-    "Connection": "close",
-    "Referer": "https://www.google.com/",
-}
+# exakte URL je Rating (R): overall__gte=R & overall__lte=R
+FUTGG_URL = "https://www.fut.gg/players/?page={page}&overall__gte={r}&overall__lte={r}"
 
-# ---------------- App & static ----------------
-app = FastAPI(title="SBC Mini (No Chem)")
-PUBLIC_DIR = Path(__file__).parent / "public"
-app.mount("/static", StaticFiles(directory=PUBLIC_DIR), name="static")
+import re
+PRICE_RE = re.compile(r"(\d+(?:[.,]\d+)?)([kKmM]?)")
 
-@app.get("/")
-def root():
-    idx = PUBLIC_DIR / "index.html"
-    return FileResponse(str(idx)) if idx.exists() else HTMLResponse("<h1>index.html fehlt</h1>", 500)
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-# ---------------- Helpers ----------------
-def parse_ratings(s: str) -> List[int]:
-    s = (s or "").strip()
-    if "-" in s:
-        a, b = [int(x) for x in s.split("-")]
-        return list(range(a, b + 1))
-    return [int(x) for x in s.split(",") if x.strip().isdigit()]
-
-def sleep_polite():
-    time.sleep(0.5 + random.random()*0.6)
-
-def get(url: str) -> httpx.Response:
-    sleep_polite()
-    with httpx.Client(follow_redirects=True, timeout=20.0, headers=REQ_HEADERS) as c:
-        r = c.get(url)
-        r.raise_for_status()
-        return r
-
-# -------- 1) Spieler-IDs pro Rating holen (serverseitig gerenderte Liste) --------
-PLAYERS_LIST_URL = "https://www.futbin.com/players?rating={rating}&page={page}"
-
-ID_HREF_RE = re.compile(r"/players/(\d+)/")
-
-def fetch_player_ids_for_rating(rating: int, max_players: int = 120) -> List[Tuple[str, str]]:
+def parse_price(text: str) -> int:
     """
-    Liefert bis zu max_players Einträge (name, id) für ein Rating.
-    Wir gehen über ein paar Seiten, bis genug IDs gefunden sind.
+    Wandelt Preisstrings wie '12,500', '12k', '1.2m' in int (Coins) um.
+    Extinct/N/A/— -> 0
     """
-    found: List[Tuple[str, str]] = []
-    for page in range(1, 6):  # bis zu 5 Seiten abklappern
-        url = PLAYERS_LIST_URL.format(rating=rating, page=page)
-        try:
-            html = get(url).text
-        except Exception:
-            break
-        soup = BeautifulSoup(html, "html.parser")
-        # Finde Links, die wie /players/<id>/… aussehen
-        for a in soup.select("a[href*='/players/']"):
-            href = a.get("href") or ""
-            m = ID_HREF_RE.search(href)
-            if not m:
-                continue
-            pid = m.group(1)
-            name = (a.get_text(strip=True) or "").replace("\n", " ").strip()
-            if pid and name and (name, pid) not in found:
-                found.append((name, pid))
-            if len(found) >= max_players:
-                return found
-        # Wenn kaum Links auf der Seite -> vermutlich JS/Block, weiter versuchen
-    return found
-
-# -------- 2) FUTBIN JSON-Preise je Spieler-ID --------
-# Wir probieren Jahr 25 und als Fallback 24 (EA FC 25/24)
-PRICE_ENDPOINTS = [
-    "https://www.futbin.com/25/playerPrices?player={pid}",
-    "https://www.futbin.com/24/playerPrices?player={pid}",
-]
-
-def best_price_from_price_json(js: dict) -> int:
-    """
-    Nimmt die JSON-Struktur von /playerPrices und extrahiert den kleinsten sinnvollen Preis.
-    Struktur (typisch):
-      { "<id>": { "prices": { "ps": {...}, "xbox": {...}, "pc": {...} } } }
-    In den Plattformobjekten gibt es oft Keys wie "LCPrice" oder "LC" (als Strings mit Kommas).
-    """
-    if not isinstance(js, dict) or not js:
+    t = (text or "").strip().lower()
+    if not t or any(bad in t for bad in ("extinct", "n/a", "—", "-", "unavailable")):
         return 0
-    root = next(iter(js.values()))  # das Objekt unter der ID
-    prices = root.get("prices") if isinstance(root, dict) else None
-    if not isinstance(prices, dict):
+    # Leerzeichen entfernen, Komma zu Punkt
+    t = t.replace(" ", "")
+    m = PRICE_RE.search(t)
+    if not m:
         return 0
+    num = float(m.group(1).replace(",", "."))
+    suf = m.group(2)
+    if suf == "k" or suf == "K":
+        num *= 1_000
+    elif suf == "m" or suf == "M":
+        num *= 1_000_000
+    return int(round(num))
 
-    candidates: List[int] = []
-    for plat, pdata in prices.items():
-        if not isinstance(pdata, dict):
-            continue
-        # Sammele alle numerisch interpretierbaren Preisstrings
-        for k in ("LCPrice", "LC", "MinPrice", "maxPrice", "PRP", "price"):
-            v = pdata.get(k)
-            if isinstance(v, str):
-                digits = "".join(ch for ch in v if ch.isdigit())
-                if digits:
-                    candidates.append(int(digits))
-            elif isinstance(v, (int, float)):
-                candidates.append(int(v))
-    return min(candidates) if candidates else 0
-
-def fetch_price_for_player_id(pid: str) -> int:
-    for tpl in PRICE_ENDPOINTS:
-        url = tpl.format(pid=pid)
-        try:
-            r = get(url)
-            # Kann text/html mit JSON als Text sein → robust parsen
-            js = r.json()
-            p = best_price_from_price_json(js)
-            if p > 0:
-                return p
-        except Exception:
-            continue
-    return 0
-
-def scrape_cheapest_for_rating_via_json(rating: int, per_rating_limit: int = 60) -> List[Dict]:
+def scrape_futgg_one_page(rating: int, page: int) -> list[dict]:
     """
-    Pipeline:
-      - IDs für Rating holen (HTML-Liste, meist serverseitig gerendert)
-      - Für jede ID JSON-Preis holen
-      - Günstigste Liste zurückgeben: [{name, price}, ...]
+    Holt eine Seite von fut.gg für ein Rating und parst Name + Preis.
+    Entfernt Duplikate und filtert Preis==0 (Extinct etc.).
     """
-    pairs = fetch_player_ids_for_rating(rating, max_players=per_rating_limit)
-    items: List[Dict] = []
-    for name, pid in pairs:
-        price = fetch_price_for_player_id(pid)
-        if price > 0:
+    html = get_html(FUTGG_URL.format(page=page, r=rating))
+    soup = BeautifulSoup(html, "html.parser")
+    items: list[dict] = []
+
+    # A) Karten-Layout
+    # (fut.gg ändert Klassen gelegentlich – wir nehmen mehrere Varianten.)
+    cards = soup.select(
+        ".player-card, [class*='PlayerCard'], [class*='PlayersList_item__card']"
+    )
+    for card in cards:
+        name_el = (
+            card.select_one(".player-name")
+            or card.select_one("[class*='name']")
+            or card.select_one("a[href*='/players/']")
+        )
+        price_el = (
+            card.select_one(".price")
+            or card.select_one(".price-value")
+            or card.select_one("[class*='price']")
+        )
+        name = (name_el.get_text(strip=True) if name_el else "").strip()
+        price = parse_price(price_el.get_text() if price_el else "")
+        if name and price > 0:
             items.append({"name": name, "price": price})
-    items.sort(key=lambda x: x["price"])
-    return items
 
-def scrape_many(ratings: List[int]) -> Dict[str, List[Dict]]:
-    data: Dict[str, List[Dict]] = {}
+    # B) Fallback: Tabellen-Layout
+    if not items:
+        for tr in soup.select("table tbody tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 3:
+                continue
+            name_el = tr.select_one("td:nth-child(2) a") or tds[1]
+            price_el = tr.select_one("td:nth-child(3), td .price") or tds[2]
+            name = (name_el.get_text(strip=True) if name_el else "").strip()
+            price = parse_price(price_el.get_text(strip=True) if price_el else "")
+            if name and price > 0:
+                items.append({"name": name, "price": price})
+
+    # deduplizieren (gleiches (name, price) nur einmal)
+    seen = set()
+    uniq = []
+    for it in items:
+        key = (it["name"], it["price"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(it)
+
+    return sorted(uniq, key=lambda x: x["price"])
+
+def scrape_futgg_for_rating(rating: int, max_pages: int = 3, min_needed: int = 25) -> list[dict]:
+    """
+    Läuft Seite 1..max_pages ab, bis genügend Spieler mit Preis>0 gefunden sind.
+    """
+    all_items: list[dict] = []
+    for p in range(1, max_pages + 1):
+        page_items = scrape_futgg_one_page(rating, p)
+        # nur >0 Preise behalten (Extinct etc. raus)
+        page_items = [x for x in page_items if x["price"] > 0]
+        all_items.extend(page_items)
+        if len(all_items) >= min_needed:
+            break
+    all_items.sort(key=lambda x: x["price"])
+    return all_items
+
+def scrape_many(ratings: list[int]) -> dict[str, list[dict]]:
+    data: dict[str, list[dict]] = {}
     for r in ratings:
         try:
-            data[str(r)] = scrape_cheapest_for_rating_via_json(r)
+            data[str(r)] = scrape_futgg_for_rating(r)
         except Exception:
             data[str(r)] = []
     return data
-
-# ---------------- API ----------------
-@app.get("/prices")
-def get_prices(
-    ratings: str = Query(RATINGS_DEFAULT),
-    force: int = Query(0),
-    x_api_key: str = Header(None)
-):
-    if force == 1 and x_api_key != APP_TOKEN:
-        raise HTTPException(401, "Unauthorized")
-
-    want = parse_ratings(ratings)
-    now = time.time()
-    stale = (now - CACHE["ts"]) > MAX_AGE_SECONDS
-    have_all = all(str(r) in CACHE["data"] and CACHE["data"][str(r)] for r in want)
-
-    if force == 1 or stale or not have_all:
-        CACHE["data"].update(scrape_many(want))
-        CACHE["ts"] = now
-
-    out = {str(r): CACHE["data"].get(str(r), []) for r in want}
-    return JSONResponse(out)
+# ========= ENDE FUT.GG SCRAPER =========
