@@ -1,53 +1,112 @@
 <!DOCTYPE html>
 <html lang="de">
 <head>
-  <meta charset="UTF-8">
-  <title>SBC Optimizer (No Chem)</title>
+  <meta charset="UTF-8" />
+  <title>SBC Players – Live Tabelle</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    input, button { margin: 5px; padding: 6px; }
-    pre { background: #f0f0f0; padding: 10px; border-radius: 4px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    input, button { font-size: 16px; padding: 8px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { padding: 8px; border-bottom: 1px solid #eee; text-align: left; }
+    th button { background: none; border: none; font-weight: 700; cursor: pointer; padding: 0; }
+    .muted { color: #666; font-size: 14px; margin-top: 6px; }
   </style>
 </head>
 <body>
-  <h1>SBC Optimizer (No Chem)</h1>
+  <h1>SBC Players – Live Tabelle</h1>
 
-  <label for="ratings">Erlaubte Ratings:</label>
-  <input id="ratings" type="text" value="82-86">
-  <br>
+  <div class="row">
+    <label>Ratings:
+      <input id="ratings" type="text" value="82-86" />
+    </label>
+    <button id="load">Tabelle laden</button>
+    <button id="admin">Frisch laden (Admin)</button>
+    <input id="search" type="text" placeholder="Suche nach Name…" />
+    <span id="status" class="muted"></span>
+  </div>
 
-  <button onclick="loadPrices()">Preise laden</button>
-  <button onclick="loadDebug()">Debug (erste 5 Spieler)</button>
-
-  <h2>Antwort:</h2>
-  <pre id="output">Noch nichts geladen…</pre>
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th><button data-sort="rating">Rating ⭥</button></th>
+        <th><button data-sort="name">Name ⭥</button></th>
+        <th><button data-sort="price">Preis ⭥</button></th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 
   <script>
-    async function loadPrices() {
-      const ratings = document.getElementById("ratings").value;
-      const url = `/prices?ratings=${encodeURIComponent(ratings)}`;
-      try {
-        const res = await fetch(url);
-        const data = await res.json();
-        document.getElementById("output").textContent =
-          JSON.stringify(data, null, 2);
-      } catch (err) {
-        document.getElementById("output").textContent = "Fehler: " + err;
+    let rows = [];
+    let adminToken = "";
+    let sortKey = "price";
+    let sortDir = 1; // 1=asc, -1=desc
+
+    const el = id => document.getElementById(id);
+
+    async function fetchPlayers(force=false){
+      const ratings = el("ratings").value.trim() || "82-86";
+      let url = `/players_flat?ratings=${encodeURIComponent(ratings)}`;
+      if (force) url += "&force=1";
+
+      const headers = {};
+      if (force && adminToken) headers["x-api-key"] = adminToken;
+
+      el("status").textContent = "Lade …";
+      const r = await fetch(url, { headers, cache: "no-store" });
+      if (!r.ok) {
+        el("status").textContent = "Fehler: " + r.status + " " + r.statusText;
+        rows = []; render(); return;
       }
+      rows = await r.json();
+      el("status").textContent = `Geladen: ${rows.length} Spieler`;
+      render();
     }
 
-    async function loadDebug() {
-      const ratings = document.getElementById("ratings").value;
-      const url = `/debug_prices?ratings=${encodeURIComponent(ratings)}`;
-      try {
-        const res = await fetch(url);
-        const data = await res.json();
-        document.getElementById("output").textContent =
-          JSON.stringify(data, null, 2);
-      } catch (err) {
-        document.getElementById("output").textContent = "Fehler: " + err;
+    function render(){
+      const q = el("search").value.trim().toLowerCase();
+      let data = rows;
+      if (q){
+        data = data.filter(x => x.name.toLowerCase().includes(q));
       }
+      data = data.slice().sort((a,b)=>{
+        const A = a[sortKey], B = b[sortKey];
+        if (A < B) return -1*sortDir;
+        if (A > B) return  1*sortDir;
+        return 0;
+      });
+      const tbody = document.querySelector("#tbl tbody");
+      tbody.innerHTML = data.map(x => `
+        <tr>
+          <td>${x.rating}</td>
+          <td>${x.name}</td>
+          <td>${Number(x.price).toLocaleString()}</td>
+        </tr>
+      `).join("");
     }
+
+    // Events
+    el("load").onclick = () => fetchPlayers(false);
+    el("admin").onclick = async () => {
+      const maybe = prompt("Admin-Token (nur für force=1):", "");
+      if (maybe !== null) adminToken = maybe.trim();
+      fetchPlayers(true);
+    };
+    el("search").oninput = render;
+
+    document.querySelectorAll("th button[data-sort]").forEach(btn=>{
+      btn.onclick = () => {
+        const key = btn.getAttribute("data-sort");
+        if (sortKey === key) sortDir = -sortDir;
+        else { sortKey = key; sortDir = key==="price" ? 1 : -1; }
+        render();
+      };
+    });
+
+    // Autoload beim Öffnen
+    fetchPlayers(false);
   </script>
 </body>
 </html>
