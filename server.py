@@ -26,7 +26,7 @@ def root():
 # --- Scraper-Funktionen ---
 async def scrape_rating(page, rating:int):
     url = f"https://www.futbin.com/squad-building-challenges/cheapest?r={rating}"
-    await page.goto(url, timeout=60000)
+    await page.goto(url, timeout=60000).
     await page.wait_for_selector("table")
     await asyncio.sleep(1.2 + random.random())  # kurze Wartezeit für JS
     rows = await page.query_selector_all("table tbody tr")
